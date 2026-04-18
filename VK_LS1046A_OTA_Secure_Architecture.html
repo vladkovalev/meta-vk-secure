@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LS1046A Multi‑Core OTA + Secure Boot Architecture</title>
+  <style>
+    :root {
+      --fg:#111;
+      --muted:#555;
+      --border:#ddd;
+      --bg:#fff;
+      --codebg:#f6f8fa;
+      --accent:#0b5fff;
+    }
+    @page { margin: 18mm; }
+    html, body { background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { max-width: 980px; margin: 0 auto; padding: 24px; line-height: 1.45; }
+    h1,h2,h3 { line-height: 1.2; margin: 1.1em 0 0.4em; }
+    h1 { font-size: 30px; border-bottom: 2px solid var(--border); padding-bottom: 10px; }
+    h2 { font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    h3 { font-size: 17px; }
+    p { margin: 0.5em 0; }
+    .meta { color:var(--muted); font-size: 13px; margin-top: -8px; }
+    .toc { border:1px solid var(--border); padding: 12px 14px; border-radius: 10px; background: #fcfcfc; }
+    .toc a { color:var(--accent); text-decoration:none; }
+    .toc ul { margin: 0.4em 0 0.2em 1.2em; }
+    .callout { border-left: 4px solid var(--accent); background: #f3f7ff; padding: 10px 12px; margin: 12px 0; }
+    .warn { border-left-color:#b42318; background:#fff4f4; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    pre { background: var(--codebg); border:1px solid var(--border); padding: 10px 12px; border-radius: 10px; overflow:auto; }
+    .diagram { background: #fff; border:1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin: 10px 0; }
+    .diagram pre { border:none; background:transparent; padding:0; margin:0; }
+    table { border-collapse: collapse; width: 100%; margin: 10px 0 14px; }
+    th, td { border:1px solid var(--border); padding: 8px 10px; vertical-align: top; }
+    th { background:#fafafa; text-align:left; }
+    .small { font-size: 13px; color: var(--muted); }
+    .hr { height:1px; background:var(--border); margin: 18px 0; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid var(--border); font-size: 12px; color: var(--muted); }
+    .sectionbreak { page-break-before: always; }
+    @media print {
+      a { color: inherit; text-decoration: none; }
+      .toc { page-break-after: avoid; }
+    }
+  </style>
+</head>
+<body>
+
+<h1>LS1046A Multi‑Core OTA + Secure Boot Architecture</h1>
+<p class="meta">
+  <span class="pill">Platform: NXP Layerscape LS1046A (ls1046afrwy)</span>
+  <span class="pill">Yocto: scarthgap</span>
+  <span class="pill">Boot: U‑Boot + FIT</span>
+  <span class="pill">Doc date: 2026‑04‑18</span>
+</p>
+
+<div class="callout">
+  <b>Purpose</b>: Provide a print‑ready architecture overview of:
+  <ul>
+    <li>Initial repository/layer approach</li>
+    <li>FIT image contents (kernel + DTB + initramfs)</li>
+    <li>Multi‑core roles and deterministic “boot shift” rotation</li>
+    <li>Partition types and storage layout (shared + per‑core)</li>
+    <li>OTA update mechanics (rootfs A/B + per‑core FIT A/B)</li>
+    <li>Security overlay layer and how it differs from non‑secure builds</li>
+    <li>Development bypass for <code>OTA bundle verification</code> without bypassing FIT signatures</li>
+  </ul>
+</div>
+
+<div class="toc">
+  <b>Table of Contents</b>
+  <ul>
+    <li><a href="#repo">1. Repositories and Layers</a></li>
+    <li><a href="#fit">2. FIT Image (What it is, What it contains)</a></li>
+    <li><a href="#storage">3. Storage / Partition Model</a></li>
+    <li><a href="#multicore">4. Multi‑Core Architecture</a></li>
+    <li><a href="#roles">5. Role Rotation (“Boot Shift”) Mechanism</a></li>
+    <li><a href="#bootflow">6. Boot Flow (U‑Boot → Linux)</a></li>
+    <li><a href="#ota">7. OTA Update Flow (Rootfs A/B + FIT A/B)</a></li>
+    <li><a href="#security">8. Security Layer (meta‑vk‑secure)</a></li>
+    <li><a href="#bypass">9. “Bypass fuses write” — What is actually bypassable</a></li>
+    <li><a href="#vkota">10. VK_OTA_BUNDLE_VERIFY_MODE (enforce / warn / off)</a></li>
+    <li><a href="#ops">11. Operational Notes and Recommendations</a></li>
+  </ul>
+</div>
+
+<div class="hr"></div>
+
+<h2 id="repo">1. Repositories and Layers</h2>
+
+<h3>1.1 Functional layer: meta‑vk‑custom</h3>
+<p>
+  <b>meta‑vk‑custom</b> implements the platform functionality:
+  FIT generation configuration, initramfs, role awareness, OTA update logic,
+  shared environment (shared‑env) artifacts, and U‑Boot boot scripts.
+</p>
+<table>
+  <tr><th>Area</th><th>What it provides</th></tr>
+  <tr>
+    <td>FIT enablement</td>
+    <td>Machine include that switches kernel output to <code>fitImage</code> and includes initramfs as a separate FIT node</td>
+  </tr>
+  <tr>
+    <td>Initramfs</td>
+    <td>Minimal initramfs image + init script that selects the correct rootfs slot and switches to real rootfs</td>
+  </tr>
+  <tr>
+    <td>Shared env</td>
+    <td><code>shared-env.itb</code> FIT container holding boot cycle, rootfs slot state, optional overrides</td>
+  </tr>
+  <tr>
+    <td>Boot script</td>
+    <td><code>boot-ota.scr</code> (compiled from <code>boot-ota.cmd</code>) to compute roles, select slots, and boot the FIT</td>
+  </tr>
+  <tr>
+    <td>OTA agents</td>
+    <td>Update agent and post‑boot health checks (role-aware)</td>
+  </tr>
+</table>
+
+<h3>1.2 Security overlay: meta‑vk‑secure (recommended as a separate private repo)</h3>
+<p>
+  <b>meta‑vk‑secure</b> overlays security behavior (via <code>.bbappend</code> and additional recipes),
+  enabling secure boot hardening: FIT signature enforcement, bundle verification tooling, dm‑verity, encryption.
+</p>
+
+<table>
+  <tr><th>Feature</th><th>Mechanism</th><th>Notes</th></tr>
+  <tr>
+    <td>FIT signature enforcement</td>
+    <td>U‑Boot config + embedded public key</td>
+    <td>Prevents booting modified kernel/DTB/initramfs</td>
+  </tr>
+  <tr>
+    <td>Shared env signing</td>
+    <td>Sign <code>shared-env.itb</code></td>
+    <td>Prevents tampering with boot cycle / slot variables</td>
+  </tr>
+  <tr>
+    <td>OTA bundle verification</td>
+    <td>Manifest signature + artifact hashes</td>
+    <td>Protects update channel (can be dev‑bypassed using runtime mode)</td>
+  </tr>
+  <tr>
+    <td>dm‑verity</td>
+    <td>Rootfs hash tree + root hash</td>
+    <td>Rootfs integrity; typically implies read-only rootfs</td>
+  </tr>
+  <tr>
+    <td>LUKS data encryption</td>
+    <td>dm‑crypt / cryptsetup (CAAM-ready)</td>
+    <td>Encrypt per‑core data partitions</td>
+  </tr>
+</table>
+
+<div class="callout warn">
+  <b>Commercial delivery recommendation</b>: keep <code>meta‑vk‑secure</code> in a separate private repo to enable
+  access control, separate licensing, reduced audit scope, and independent security patch cadence.
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="fit">2. FIT Image (What it is, What it contains)</h2>
+
+<p>
+  FIT (Flattened Image Tree) is a U‑Boot boot container format. It can package multiple boot artifacts and include cryptographic signatures.
+  For LS1046A, we use a FIT that includes:
+</p>
+
+<ul>
+  <li><b>Kernel</b> (<code>Image</code> for arm64)</li>
+  <li><b>Device Tree Blob (DTB)</b> (<code>fsl-ls1046a-frwy.dtb</code>)</li>
+  <li><b>Initramfs</b> (<code>core-image-minimal-initramfs.cpio.gz</code>) as a separate FIT node</li>
+</ul>
+
+<h3>2.1 FIT image conceptual content</h3>
+<div class="diagram">
+<pre>
+fitImage (FIT container)
+├─ images/
+│  ├─ kernel@1   : Linux kernel Image (arm64)
+│  ├─ fdt@1      : Board DTB (fsl-ls1046a-frwy.dtb)
+│  └─ ramdisk@1  : initramfs (cpio.gz)
+└─ configurations/
+   └─ conf@1: kernel + fdt (+ ramdisk)
+</pre>
+</div>
+
+<h3>2.2 Load addresses (typical LS1046A)</h3>
+<p class="small">
+Exact addresses depend on memory map and BSP expectations. Typical values used in the configuration:
+</p>
+<pre>
+Kernel entry/load: 0x80080000
+DTB load:          0x90000000
+Initramfs load:    0xA0000000
+</pre>
+
+<h3>2.3 Why initramfs as a separate FIT node?</h3>
+<ul>
+  <li>U‑Boot loads kernel/DTB/ramdisk explicitly from a single artifact (FIT)</li>
+  <li>Signatures can cover all boot components</li>
+  <li>Initramfs can implement early boot logic (choose correct rootfs slot, gather core identity)</li>
+</ul>
+
+<div class="sectionbreak"></div>
+
+<h2 id="storage">3. Storage / Partition Model</h2>
+
+<p>
+This solution uses a combination of:
+<ul>
+  <li><b>Shared storage</b> (visible to all cores) for rootfs A/B + shared env</li>
+  <li><b>Per‑core dedicated storage</b> for FIT A/B, local U‑Boot env, and per‑core data</li>
+</ul>
+</p>
+
+<h3>3.1 Partition types (conceptual)</h3>
+<table>
+  <tr><th>Partition type</th><th>Scope</th><th>Updated by</th><th>Purpose</th></tr>
+  <tr><td>Rootfs A</td><td>Shared</td><td>Master core only</td><td>Active or standby OS root filesystem</td></tr>
+  <tr><td>Rootfs B</td><td>Shared</td><td>Master core only</td><td>Alternate slot for A/B OTA</td></tr>
+  <tr><td>Shared env</td><td>Shared</td><td>Master (normally)</td><td>Boot cycle counter, slot state, overrides</td></tr>
+  <tr><td>FIT A</td><td>Per core</td><td>Each core itself</td><td>Kernel+DTB+initramfs slot A</td></tr>
+  <tr><td>FIT B</td><td>Per core</td><td>Each core itself</td><td>Kernel+DTB+initramfs slot B</td></tr>
+  <tr><td>U‑Boot env</td><td>Per core</td><td>Each core itself</td><td>Boot counters, selected FIT slot, rollback flags</td></tr>
+  <tr><td>Data</td><td>Per core</td><td>Never by OTA</td><td>Persistent per‑core data</td></tr>
+</table>
+
+<h3>3.2 Storage diagrams</h3>
+
+<div class="diagram">
+<pre>
+SHARED FLASH (eMMC/SD)
++--------------------------------------------------------------+
+| Rootfs A (ext4) | Rootfs B (ext4) | Shared-env (itb / ext4)  |
++--------------------------------------------------------------+
+
+PER-CORE DEDICATED FLASH (Core 1 / Core 2 / Core 3)
++-------------------------------------------------------------------+
+| FIT A | FIT B | U-Boot env (redundant) | Data (ext4, persistent)   |
++-------------------------------------------------------------------+
+</pre>
+</div>
+
+<div class="callout">
+  <b>Key property</b>: a rootfs update is performed once (Master), but FIT updates are done per-core and can be staged independently.
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="multicore">4. Multi‑Core Architecture</h2>
+
+<p>
+All cores run the same software stack, but their responsibilities can differ per boot depending on role.
+Role is derived from a shared boot cycle counter plus each core’s identity.
+</p>
+
+<h3>4.1 Core identity inputs</h3>
+<ul>
+  <li><code>vk.core_id</code> — integer (1..3)</li>
+  <li><code>vk.boot_cycle</code> — shared or local counter used to rotate roles</li>
+  <li><code>vk.core_role</code> — computed role passed to Linux userspace</li>
+  <li><code>vk.fit_slot</code> — active per-core FIT slot (A/B)</li>
+  <li><code>vk.rootfs_slot</code> — active shared rootfs slot (A/B)</li>
+</ul>
+
+<h3>4.2 Userspace consumption</h3>
+<p>
+A systemd oneshot service reads <code>/proc/cmdline</code> and writes a file such as:
+</p>
+<pre>
+/run/core-role.env
+CORE_ID=1
+CORE_ROLE=master
+BOOT_CYCLE=0
+FIT_SLOT=A
+ROOTFS_SLOT=A
+</pre>
+
+<div class="sectionbreak"></div>
+
+<h2 id="roles">5. Role Rotation (“Boot Shift”) Mechanism</h2>
+
+<h3>5.1 Rotation formula</h3>
+<div class="diagram">
+<pre>
+ROLES = [Master, Slave, Backup]
+index = (boot_cycle + core_id - 1) % 3
+role  = ROLES[index]
+</pre>
+</div>
+
+<h3>5.2 Example table</h3>
+<table>
+  <tr><th>boot_cycle</th><th>Core 1</th><th>Core 2</th><th>Core 3</th></tr>
+  <tr><td>0</td><td>Master</td><td>Slave</td><td>Backup</td></tr>
+  <tr><td>1</td><td>Backup</td><td>Master</td><td>Slave</td></tr>
+  <tr><td>2</td><td>Slave</td><td>Backup</td><td>Master</td></tr>
+</table>
+
+<h3>5.3 Shared env missing: local fallback</h3>
+<p>
+If shared env can’t be read, each core uses a local counter (<code>local_boot_cycle</code>) that it increments. This keeps the shift mechanism working under degraded conditions.
+</p>
+
+<div class="callout">
+  <b>Deterministic shift</b> avoids hardcoding a “forever master”. Over time, each core becomes master.
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="bootflow">6. Boot Flow (U‑Boot → Linux)</h2>
+
+<h3>6.1 U‑Boot responsibilities</h3>
+<ul>
+  <li>Load and (optionally) verify <code>shared-env.itb</code></li>
+  <li>Compute <code>core_role</code> from <code>boot_cycle</code> + <code>core_id</code></li>
+  <li>Select per‑core FIT slot (A/B), handle rollback counters</li>
+  <li>Select rootfs slot (A/B) based on shared env</li>
+  <li>Boot FIT and pass <code>vk.*</code> parameters via kernel bootargs</li>
+</ul>
+
+<h3>6.2 Bootargs example</h3>
+<pre>
+vk.core_id=1
+vk.core_role=master
+vk.boot_cycle=0
+vk.fit_slot=A
+vk.rootfs_slot=A
+root=LABEL=rootfsA
+</pre>
+
+<h3>6.3 Linux initramfs responsibilities</h3>
+<ul>
+  <li>Mount <code>proc</code>, <code>sys</code>, <code>dev</code></li>
+  <li>Read <code>/proc/cmdline</code></li>
+  <li>Find correct rootfs partition (LABEL=rootfsA/B)</li>
+  <li>Mount rootfs and <code>switch_root</code> into real system</li>
+</ul>
+
+<div class="sectionbreak"></div>
+
+<h2 id="ota">7. OTA Update Flow (Rootfs A/B + FIT A/B)</h2>
+
+<h3>7.1 Two independent update domains</h3>
+<table>
+  <tr><th>Domain</th><th>Scope</th><th>Updated by</th><th>Typical artifact</th></tr>
+  <tr><td>Rootfs A/B</td><td>Shared</td><td>Master only</td><td><code>core-image-ota-*.wic.bz2</code> or ext4</td></tr>
+  <tr><td>FIT A/B</td><td>Per core</td><td>Each core independently</td><td><code>fitImage</code> / ITB</td></tr>
+</table>
+
+<h3>7.2 Rootfs update (Master)</h3>
+<p>
+Master writes the new rootfs image to the standby partition (A→B or B→A), then updates shared env to indicate the new active slot on next boot.
+</p>
+<div class="diagram">
+<pre>
+1) Read current shared slot (ota_rootfs_slot=A/B)
+2) Choose standby slot
+3) dd new rootfs image -> standby partition
+4) Update shared env:
+   ota_rootfs_slot=<standby>
+   ota_rootfs_pending=1
+   ota_rootfs_confirmed=0
+5) Reboot
+6) Post-boot health-check confirms and clears pending flag
+</pre>
+</div>
+
+<h3>7.3 FIT update (each core)</h3>
+<p>
+Each core stages a new FIT into its local standby slot and sets local env flags for rollback / confirmation.
+</p>
+<div class="diagram">
+<pre>
+1) Read current FIT slot (fit_slot=A/B) from per-core env
+2) Choose standby slot
+3) flashcp new FIT -> standby area
+4) Set flags:
+   fit_upgrade_available=1
+   fit_boot_count=0
+5) Reboot
+6) Post-boot health-check confirms:
+   fit_boot_confirmed=1
+   fit_upgrade_available=0
+</pre>
+</div>
+
+<h3>7.4 Rollback concept</h3>
+<p>
+If a core fails to boot the new FIT repeatedly, U‑Boot flips back to the previous slot (A/B) based on a boot counter limit.
+</p>
+
+<div class="callout">
+  <b>Important</b>: Confirmation is core-local for FIT, and shared for rootfs (Master confirms shared rootfs).
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="security">8. Security Layer (meta‑vk‑secure)</h2>
+
+<h3>8.1 Secure vs non‑secure modes</h3>
+<table>
+  <tr><th>Aspect</th><th>Non‑secure build</th><th>Secure build (meta‑vk‑secure)</th></tr>
+  <tr>
+    <td>FIT boot</td>
+    <td>FIT can be unsigned (depending on U‑Boot config)</td>
+    <td><b>FIT signatures enforced</b> in U‑Boot (reject tampered/unsigned)</td>
+  </tr>
+  <tr>
+    <td>Shared env</td>
+    <td>Can be unsigned</td>
+    <td>Signed FIT recommended to prevent tampering with slot/role parameters</td>
+  </tr>
+  <tr>
+    <td>OTA bundle verification</td>
+    <td>Optional / not present</td>
+    <td>Manifest signature + hashes (runtime mode controls enforcement)</td>
+  </tr>
+  <tr>
+    <td>Rootfs integrity</td>
+    <td>Standard ext4</td>
+    <td>Optional dm‑verity + read-only rootfs</td>
+  </tr>
+  <tr>
+    <td>Data at rest</td>
+    <td>Plain ext4</td>
+    <td>Optional LUKS/dm‑crypt for per‑core data partitions</td>
+  </tr>
+</table>
+
+<h3>8.2 Key management (high-level)</h3>
+<ul>
+  <li>FIT signing key: signs FIT images; public key embedded in U‑Boot DTB</li>
+  <li>OTA signing key: signs manifest for OTA bundles; public cert deployed to target</li>
+  <li>SRK (Super Root Keys): used by NXP chain-of-trust tooling; fused into device for production secure boot</li>
+</ul>
+
+<div class="callout warn">
+  <b>Never commit private keys to git.</b> Use offline/HSM storage. Only public certificates should be shipped to the target.
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="bypass">9. “Bypass fuses write” — What is actually bypassable</h2>
+
+<div class="callout warn">
+  <b>Critical clarification</b>: once fuses are programmed to enable secure boot in hardware,
+  you cannot bypass ROM-level secure boot checks by software. “Bypass” can only apply to
+  <i>software-level</i> enforcement that happens after U‑Boot is running.
+</div>
+
+<h3>9.1 Not bypassable (hardware enforced)</h3>
+<ul>
+  <li>Boot ROM chain-of-trust after fuses are set (ISBC/ESBC enforcement)</li>
+  <li>If fused, unsigned bootloader/images will not run regardless of scripts or flags</li>
+</ul>
+
+<h3>9.2 Bypassable (software enforced)</h3>
+<ul>
+  <li>OTA bundle verification in userspace (manifest + hashes)</li>
+  <li>Some runtime strictness choices in Linux (e.g., warn vs enforce on verification checks)</li>
+</ul>
+
+<h3>9.3 Requested behavior</h3>
+<p>
+Signatures remain required for FIT boot (strict), but OTA bundle verification can be bypassed in development using <code>VK_OTA_BUNDLE_VERIFY_MODE</code>.
+</p>
+
+<div class="sectionbreak"></div>
+
+<h2 id="vkota">10. VK_OTA_BUNDLE_VERIFY_MODE (enforce / warn / off)</h2>
+
+<h3>10.1 What it controls</h3>
+<p>
+This flag controls how the script <code>ota-verify-bundle</code> reacts to verification failures.
+It does <b>not</b> change U‑Boot FIT signature enforcement.
+</p>
+
+<h3>10.2 Configuration file</h3>
+<pre>
+/etc/vk-secure.conf
+VK_OTA_BUNDLE_VERIFY_MODE=enforce|warn|off
+</pre>
+
+<h3>10.3 Mode semantics</h3>
+<table>
+  <tr><th>Mode</th><th>Behavior on failure</th><th>Exit code</th><th>Use case</th></tr>
+  <tr><td><code>enforce</code></td><td>Block update</td><td>1</td><td>Production</td></tr>
+  <tr><td><code>warn</code></td><td>Log warning, allow update</td><td>0</td><td>Development/integration</td></tr>
+  <tr><td><code>off</code></td><td>Skip verification entirely</td><td>0</td><td>Development only (last resort)</td></tr>
+</table>
+
+<div class="callout">
+  <b>Recommended dev mode</b>: <code>warn</code> (still performs checks and surfaces issues, but does not block iteration).
+</div>
+
+<div class="sectionbreak"></div>
+
+<h2 id="ops">11. Operational Notes and Recommendations</h2>
+
+<h3>11.1 Best practices</h3>
+<ul>
+  <li>Keep <b>FIT signature enforcement</b> enabled as early as possible in development to match production behavior.</li>
+  <li>Use <code>VK_OTA_BUNDLE_VERIFY_MODE=warn</code> only for development and CI bring-up.</li>
+  <li>In production, set <code>VK_OTA_BUNDLE_VERIFY_MODE=enforce</code> and lock down U‑Boot console if required.</li>
+  <li>Ensure the rootfs update process includes confirmation gating (pending/confirmed) to prevent “stuck in pending” states.</li>
+  <li>Do not overwrite per‑core data partitions during OTA. Keep them as separate WKS images or separate flash regions.</li>
+</ul>
+
+<h3>11.2 Common failure modes (and mitigations)</h3>
+<table>
+  <tr><th>Failure</th><th>Impact</th><th>Mitigation</th></tr>
+  <tr>
+    <td>Shared env unreadable</td>
+    <td>Cannot synchronize boot cycle / slot state</td>
+    <td>Local fallback boot_cycle increment keeps role shift operating</td>
+  </tr>
+  <tr>
+    <td>Bad staged FIT</td>
+    <td>Core fails to boot</td>
+    <td>U‑Boot rollback via boot_count limit flips FIT slot</td>
+  </tr>
+  <tr>
+    <td>Bad rootfs update</td>
+    <td>All cores may be affected</td>
+    <td>Pending/confirmed logic + health check + ability to revert slot</td>
+  </tr>
+  <tr>
+    <td>OTA bundle signature mismatch</td>
+    <td>Update blocked in production</td>
+    <td>Use dev mode warn during
