@@ -1,0 +1,14 @@
+[Unit]
+Description=LUKS data partition initialization for this core
+DefaultDependencies=no
+After=local-fs.target core-role-manager.service
+Requires=core-role-manager.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/data-encrypt-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs.target
