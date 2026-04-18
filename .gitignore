@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.pyc
+__pycache__/
+build/
+tmp/
+sstate-cache/
+downloads/
+cache/
+
+# Keys — NEVER commit private keys
+secure-boot-keys/
+*.pem
+*.key
+*.bin
+*.keyblob
+!scripts/*.sh
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
